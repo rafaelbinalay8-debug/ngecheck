@@ -1,0 +1,398 @@
+-- Delta Script: Advanced Remote Analysis & Vulnerability Scanner
+-- Author: [N]yx for He
+-- Purpose: Security research, remote enumeration, traffic monitoring
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Configuration
+local CONFIG = {
+    LOG_TO_CONSOLE = true,
+    LOG_TO_FILE = false,
+    MONITOR_ALL_REMOTES = true,
+    TEST_PARAMETER_MANIPULATION = true,
+    IDENTIFY_UNVALIDATED_REMOTES = true,
+    SCAN_FREQUENCY = 0.1, -- seconds between scans
+}
+
+-- Storage
+local REMOTE_REGISTRY = {}
+local TRAFFIC_LOG = {}
+local VULNERABILITY_CANDIDATES = {}
+
+-- Utility Functions
+local function log(msg, level)
+    level = level or "INFO"
+    local timestamp = os.date("%H:%M:%S")
+    local formatted = string.format("[%s][%s] %s", timestamp, level, msg)
+    if CONFIG.LOG_TO_CONSOLE then
+        if level == "ERROR" then
+            error(formatted)
+        elseif level == "WARN" then
+            warn(formatted)
+        else
+            print(formatted)
+        end
+    end
+end
+
+local function getRemotePath(remote)
+    local path = {}
+    local current = remote
+    while current and current ~= game do
+        table.insert(path, 1, current.Name)
+        current = current.Parent
+    end
+    return table.concat(path, ".")
+end
+
+local function analyzeArgs(args)
+    local analysis = {
+        count = #args,
+        types = {},
+        suspicious = false,
+        details = {}
+    }
+    
+    for i, arg in ipairs(args) do
+        local argType = type(arg)
+        table.insert(analysis.types, argType)
+        
+        -- Check for suspicious patterns
+        if argType == "table" then
+            -- Deep table might be client-trusted data
+            analysis.suspicious = true
+            table.insert(analysis.details, {
+                index = i,
+                type = "table",
+                note = "Complex table structure - potential client-trusted data"
+            })
+        elseif argType == "string" and #arg > 100 then
+            -- Long strings might be injection vectors
+            analysis.suspicious = true
+            table.insert(analysis.details, {
+                index = i,
+                type = "string",
+                length = #arg,
+                note = "Long string - potential injection vector"
+            })
+        elseif argType == "number" and (arg > 10000 or arg < -10000) then
+            -- Extreme values might bypass validation
+            analysis.suspicious = true
+            table.insert(analysis.details, {
+                index = i,
+                type = "number",
+                value = arg,
+                note = "Extreme value - potential overflow/bypass"
+            })
+        end
+    end
+    
+    return analysis
+end
+
+-- Remote Enumeration
+local function enumerateRemotes()
+    log("Starting remote enumeration...", "INFO")
+    
+    local function scanContainer(container, depth)
+        depth = depth or 0
+        if depth > 10 then return end -- Prevent infinite recursion
+        
+        for _, obj in ipairs(container:GetChildren()) do
+            if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
+                local path = getRemotePath(obj)
+                local remoteType = obj:IsA("RemoteEvent") and "Event" or "Function"
+                
+                REMOTE_REGISTRY[path] = {
+                    instance = obj,
+                    type = remoteType,
+                    path = path,
+                    callCount = 0,
+                    lastArgs = nil,
+                    suspicious = false
+                }
+                
+                log(string.format("Found %s: %s", remoteType, path), "INFO")
+            end
+            
+            -- Recurse into children
+            if #obj:GetChildren() > 0 then
+                scanContainer(obj, depth + 1)
+            end
+        end
+    end
+    
+    -- Scan common containers
+    local containers = {
+        ReplicatedStorage,
+        game:GetService("Workspace"),
+        game:GetService("Lighting"),
+        game:GetService("StarterGui"),
+        game:GetService("StarterPlayer"),
+    }
+    
+    for _, container in ipairs(containers) do
+        if container then
+            scanContainer(container)
+        end
+    end
+    
+    log(string.format("Enumeration complete. Found %d remotes.", #REMOTE_REGISTRY), "INFO")
+end
+
+-- Traffic Monitoring
+local oldNamecall
+oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+    if not checkcaller() then
+        local method = getnamecallmethod()
+        
+        if method == "FireServer" or method == "InvokeServer" then
+            local path = getRemotePath(self)
+            local args = {...}
+            local argAnalysis = analyzeArgs(args)
+            
+            -- Update registry
+            if REMOTE_REGISTRY[path] then
+                REMOTE_REGISTRY[path].callCount = REMOTE_REGISTRY[path].callCount + 1
+                REMOTE_REGISTRY[path].lastArgs = args
+                
+                if argAnalysis.suspicious then
+                    REMOTE_REGISTRY[path].suspicious = true
+                end
+            end
+            
+            -- Log traffic
+            local logEntry = {
+                timestamp = os.time(),
+                remote = path,
+                method = method,
+                args = args,
+                analysis = argAnalysis
+            }
+            table.insert(TRAFFIC_LOG, logEntry)
+            
+            -- Console output
+            if CONFIG.LOG_TO_CONSOLE then
+                local argStr = ""
+                for i, arg in ipairs(args) do
+                    local s = tostring(arg)
+                    if #s > 50 then s = s:sub(1, 50) .. "..." end
+                    argStr = argStr .. "[" .. i .. "]=" .. s .. " "
+                end
+                
+                local prefix = argAnalysis.suspicious and "[SUSPICIOUS]" or "[REMOTE]"
+                log(string.format("%s %s %s | %s", prefix, method, path, argStr), "INFO")
+            end
+            
+            -- Vulnerability detection
+            if CONFIG.IDENTIFY_UNVALIDATED_REMOTES and argAnalysis.suspicious then
+                local vulnEntry = {
+                    remote = path,
+                    reason = "Suspicious argument pattern detected",
+                    details = argAnalysis.details,
+                    timestamp = os.time()
+                }
+                table.insert(VULNERABILITY_CANDIDATES, vulnEntry)
+                log(string.format("[VULN CANDIDATE] %s - %s", path, vulnEntry.reason), "WARN")
+            end
+        end
+    end
+    
+    return oldNamecall(self, ...)
+end))
+
+-- Parameter Manipulation Testing
+local function testParameterManipulation(remotePath, originalArgs)
+    if not CONFIG.TEST_PARAMETER_MANIPULATION then return end
+    
+    local remote = REMOTE_REGISTRY[remotePath]
+    if not remote then
+        log("Remote not found: " .. remotePath, "ERROR")
+        return
+    end
+    
+    log(string.format("Testing parameter manipulation on: %s", remotePath), "INFO")
+    
+    -- Test 1: Type confusion
+    if #originalArgs > 0 then
+        local modifiedArgs = {}
+        for i, arg in ipairs(originalArgs) do
+            if type(arg) == "number" then
+                table.insert(modifiedArgs, tostring(arg)) -- Number to string
+            elseif type(arg) == "string" then
+                table.insert(modifiedArgs, tonumber(arg) or 0) -- String to number
+            else
+                table.insert(modifiedArgs, arg)
+            end
+        end
+        
+        log("Test 1: Type confusion - sending modified types", "INFO")
+        -- Note: Actually firing would require knowing if it's Event or Function
+        -- This is a template for manual testing
+    end
+    
+    -- Test 2: Extreme values
+    if #originalArgs > 0 then
+        local modifiedArgs = {}
+        for i, arg in ipairs(originalArgs) do
+            if type(arg) == "number" then
+                table.insert(modifiedArgs, 999999) -- Extreme value
+            else
+                table.insert(modifiedArgs, arg)
+            end
+        end
+        
+        log("Test 2: Extreme values - sending overflow values", "INFO")
+    end
+    
+    -- Test 3: Missing arguments
+    if #originalArgs > 1 then
+        local modifiedArgs = {originalArgs[1]} -- Only first arg
+        log("Test 3: Missing arguments - sending incomplete data", "INFO")
+    end
+    
+    -- Test 4: Extra arguments
+    local modifiedArgs = {}
+    for _, arg in ipairs(originalArgs) do
+        table.insert(modifiedArgs, arg)
+    end
+    table.insert(modifiedArgs, "extra_arg")
+    table.insert(modifiedArgs, 12345)
+    log("Test 4: Extra arguments - sending additional data", "INFO")
+end
+
+-- Vulnerability Scanner
+local function scanForVulnerabilities()
+    log("Starting vulnerability scan...", "INFO")
+    
+    -- Pattern 1: Remotes with "admin", "mod", "command" in name
+    for path, remote in pairs(REMOTE_REGISTRY) do
+        local lowerPath = path:lower()
+        if lowerPath:find("admin") or lowerPath:find("mod") or lowerPath:find("command") then
+            log(string.format("[PRIORITY] Admin-related remote: %s", path), "WARN")
+            table.insert(VULNERABILITY_CANDIDATES, {
+                remote = path,
+                reason = "Admin-related remote name pattern",
+                priority = "HIGH"
+            })
+        end
+    end
+    
+    -- Pattern 2: Remotes that accept tables (client-trusted data)
+    for _, entry in ipairs(TRAFFIC_LOG) do
+        if entry.analysis.suspicious then
+            local alreadyLogged = false
+            for _, vuln in ipairs(VULNERABILITY_CANDIDATES) do
+                if vuln.remote == entry.remote then
+                    alreadyLogged = true
+                    break
+                end
+            end
+            
+            if not alreadyLogged then
+                table.insert(VULNERABILITY_CANDIDATES, {
+                    remote = entry.remote,
+                    reason = "Suspicious argument pattern in traffic",
+                    details = entry.analysis.details,
+                    priority = "MEDIUM"
+                })
+            end
+        end
+    end
+    
+    -- Pattern 3: High-frequency remotes (potential race conditions)
+    local remoteCounts = {}
+    for _, entry in ipairs(TRAFFIC_LOG) do
+        remoteCounts[entry.remote] = (remoteCounts[entry.remote] or 0) + 1
+    end
+    
+    for path, count in pairs(remoteCounts) do
+        if count > 100 then -- Arbitrary threshold
+            log(string.format("[NOTE] High-frequency remote: %s (%d calls)", path, count), "INFO")
+        end
+    end
+    
+    log(string.format("Scan complete. Found %d vulnerability candidates.", #VULNERABILITY_CANDIDATES), "INFO")
+end
+
+-- Report Generator
+local function generateReport()
+    log("Generating vulnerability report...", "INFO")
+    
+    print("\n=== VULNERABILITY ANALYSIS REPORT ===")
+    print(string.format("Total Remotes Found: %d", #REMOTE_REGISTRY))
+    print(string.format("Traffic Entries Logged: %d", #TRAFFIC_LOG))
+    print(string.format("Vulnerability Candidates: %d", #VULNERABILITY_CANDIDATES))
+    
+    print("\n--- HIGH PRIORITY ---")
+    for _, vuln in ipairs(VULNERABILITY_CANDIDATES) do
+        if vuln.priority == "HIGH" then
+            print(string.format("[%s] %s", vuln.priority or "MEDIUM", vuln.remote))
+            print("  Reason: " .. vuln.reason)
+        end
+    end
+    
+    print("\n--- MEDIUM PRIORITY ---")
+    for _, vuln in ipairs(VULNERABILITY_CANDIDATES) do
+        if vuln.priority == "MEDIUM" or not vuln.priority then
+            print(string.format("[%s] %s", vuln.priority or "MEDIUM", vuln.remote))
+            print("  Reason: " .. vuln.reason)
+            if vuln.details then
+                for _, detail in ipairs(vuln.details) do
+                    print(string.format("  - Arg %d (%s): %s", detail.index, detail.type, detail.note))
+                end
+            end
+        end
+    end
+    
+    print("\n--- REMOTE STATISTICS ---")
+    for path, remote in pairs(REMOTE_REGISTRY) do
+        if remote.callCount > 0 then
+            print(string.format("%s: %d calls | Suspicious: %s", path, remote.callCount, tostring(remote.suspicious)))
+        end
+    end
+    
+    print("\n=== END REPORT ===\n")
+end
+
+-- Main Execution
+local function main()
+    log("Initializing Advanced Remote Analysis Script...", "INFO")
+    
+    -- Step 1: Enumerate all remotes
+    enumerateRemotes()
+    
+    -- Step 2: Start monitoring (hook already active)
+    log("Traffic monitoring active. Hook installed.", "INFO")
+    
+    -- Step 3: Wait for traffic
+    log("Collecting traffic data... (wait 10 seconds)", "INFO")
+    wait(10)
+    
+    -- Step 4: Scan for vulnerabilities
+    scanForVulnerabilities()
+    
+    -- Step 5: Generate report
+    generateReport()
+    
+    log("Script execution complete. Monitor continues running.", "INFO")
+end
+
+-- Start
+main()
+
+-- Export functions for manual testing
+_G.RemoteAnalyzer = {
+    enumerateRemotes = enumerateRemotes,
+    scanForVulnerabilities = scanForVulnerabilities,
+    generateReport = generateReport,
+    testParameterManipulation = testParameterManipulation,
+    getRegistry = function() return REMOTE_REGISTRY end,
+    getTrafficLog = function() return TRAFFIC_LOG end,
+    getVulnerabilities = function() return VULNERABILITY_CANDIDATES end
+}
+
+log("Manual testing functions available via _G.RemoteAnalyzer", "INFO")
+log("Example: _G.RemoteAnalyzer.generateReport()", "INFO")
