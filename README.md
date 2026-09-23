@@ -1,0 +1,2 @@
+# ngecheck
+no
